@@ -273,7 +273,11 @@ local function prepare(cx: WindowCx, fetch: boolean, done: (Source?, Failure?, W
 			done(source(known.sha), nil, at)
 			return
 		end
-		local args = { "log", "-p", "-U0", "--no-color", "--format=%x1e%H", MIRROR_TIP, "--", "plugin.toml" }
+		-- along the branch's first parents, a merge diffed against its first parent: git shows no diff for a merge
+		-- otherwise, so a version set in one (a pull request merged with a version bump) would never be found, and
+		-- `<sha>^` below steps back along the same line
+		local args =
+			{ "log", "-m", "--first-parent", "-p", "-U0", "--no-color", "--format=%x1e%H", MIRROR_TIP, "--", "plugin.toml" }
 		git(at, MIRROR, args, 20000, function(log: Git, at1: WindowCx)
 			local commits = version_commits(log.out)
 			local found: number? = nil
