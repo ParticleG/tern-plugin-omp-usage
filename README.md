@@ -34,8 +34,9 @@ Hover it for each window's meter, reset time and saved resets:
   in the widget bar's **Plugin segments**, or the palette. Estimates describe the remaining workload, not
   official token allowances or cash balances. The hover keeps to the estimates; observed usage, observation
   time and every other quantity are in the details, which scroll and adapt to narrow windows.
-- **The same in every pane.** omp sessions each check usage on their own clock; every pane shows the newest
-  numbers any of them got.
+- **The same sources in every pane.** Each omp session publishes its own quota snapshot. The plugin combines
+  the newest observations per provider, so a native-only session cannot erase another session's CPA or Keeper
+  quotas. Each observation expires independently; polling Claude does not keep old Codex quotas alive.
 - **Settings panel** (Ctrl+Alt+U) for what shows, the order, each provider's windows and colors.
 - **Installs from Tern**: Preferences › Plugins › Install, or `tern plugin install`; it sets up its omp extension
   itself.
@@ -46,8 +47,9 @@ Hover it for each window's meter, reset time and saved resets:
 
 | Part | What it does |
 | --- | --- |
-| `omp/extensions/usage-remaining.js` | omp extension: fetches native and configured external quotas, sets the line as an extension status, and caches every model's and provider's line and details. |
+| `omp/extensions/usage-remaining.js` | omp extension: fetches native and configured external quotas, sets the line as an extension status, and publishes an isolated session snapshot with model/provider details and observation times. |
 | `omp/extensions/usage-sources/` | CLIProxyAPI and Keeper clients, source configuration, observation freshness, and semantic quantity/estimate formatting. |
+| `cache.luau` | Reads session snapshots asynchronously and selects the newest unexpired model/provider observations for the Tern view. |
 | `plugin.toml`, `window.luau`, `details.luau`, `update.luau`, `bar.css` | Tern plugin: draws the line above the context bar, hides the statuses it redraws from omp's bar (keeping the session cost), and adds native quota details, the settings panel and updates. Installed from Tern, it also puts a loader in `~/.omp/agent/extensions` that runs the omp extension from the plugin's folder. |
 
 The original native display was tested with Tern 0.9.14 and omp 18.18.6 on Windows, and installing from Tern
@@ -316,11 +318,25 @@ accounts or one account for those details.
 
 ### Development checks
 
-The adapters use built-in HTTP APIs and need no package installation. Run their deterministic parsing,
-authentication, freshness, source-isolation and estimate-boundary checks with:
+The adapters and snapshot writer use built-in APIs and need no package installation. Run their deterministic
+parsing, authentication, freshness, concurrent-instance and estimate-boundary checks with:
 
 ```sh
-node --test tests/cpa-source.test.mjs tests/keeper-source.test.mjs tests/quota-details.test.mjs tests/usage-sources.test.mjs tests/usage-remaining.test.mjs
+node --test tests/*.test.mjs
+```
+
+The Luau reader's merge, expiry and asynchronous callback cases run with the standalone Luau CLI:
+
+```sh
+luau tests/cache-reader-cli.luau
+```
+
+To execute the same cases with Tern's JSON decoder and a real asynchronous disk read, use the isolated
+integration test. It needs a working `tern serve` renderer (`TERN_BIN` can select a build), and never reads
+your installed plugins, usage cache or credentials:
+
+```sh
+node --test tests/cache-reader.integration.mjs
 ```
 
 Tests cover source API contracts and current-model quota selection, not live account availability.
@@ -395,11 +411,23 @@ there. Its grip, now a cross, puts it back:
 
 <img src="docs/images/menu-accounts.png" alt="The palette's Claude accounts menu: All accounts (8 accounts, one after another), Combined (one set of windows, shares averaged), Combined by plan (same windows together, shares averaged), then each account that is on with what it has left" width="566">
 
-The extension caches every line in `~/.omp/cache/usage-remaining.json`. Current model, All and Selected providers,
-subagent models, accounts and the card's reset dates read it; a cache older than 10 minutes is ignored, and the
-line then shows the focused session's own status. Every omp session writes the newest numbers it fetched there, so
-every pane shows the same ones. A session whose numbers are older than the cache's leaves it alone, and one
-started before the extension was updated stops writing it, so neither can put back older numbers.
+Each extension instance writes its own private, atomically replaced JSON snapshot in
+`~/.omp/cache/usage-remaining/`. Current model, All and Selected providers, subagent models, accounts and the
+card's reset dates use the newest observation available for each provider/model across those snapshots.
+A session that knows only native quotas cannot remove another session's CPA or Keeper accounts. Empty,
+unmapped model entries do not erase another session's mapped quota, and ambiguous model names remain
+ambiguous rather than borrowing an unrelated account's quota.
+
+Snapshots expire after 10 minutes. Observations also expire independently using their source's freshness
+limit, capped at 10 minutes: a newer native fetch does not renew an older external observation. A normal
+session exit removes only that instance's snapshot. At startup, the extension removes orphan snapshots
+only when their owning process is confirmed gone; it never deletes another live session's file based on
+age. Expired snapshots cannot keep quotas alive. With no applicable cached observation, the line uses
+the focused session's own status.
+
+After updating to this cache format, restart the omp sessions whose quotas you want to display. The old
+`~/.omp/cache/usage-remaining.json` file is no longer read, so an older running instance cannot overwrite the
+new snapshots. No CPA or Keeper restart is needed.
 
 ## Update
 
@@ -452,8 +480,8 @@ update, or after the plugin's folder moved), it says so:
 | --- | --- |
 | `tern plugin list` isn't `ready` | It prints the error; Tern's log is `%LOCALAPPDATA%\Tern\Logs\tern.log` |
 | No line | Focused pane is omp; its provider has limits; omp restarted after install; extension statuses on (step 2); `~/.omp/agent/extensions/usage-remaining.js` there (installed) or `extensions:` in `config.yml` naming it (clone) |
-| All/Selected show only the current model, or panes show different numbers | The cache is stale: restart omp sessions |
-| The card's reset dates flip between two values | An omp session from before an update is still writing the cache: restart omp sessions |
+| All/Selected show only the current model, or external quotas disappear | At least one running omp session must have the source configuration and credential environment variables. After updating, restart those sessions so they publish into `~/.omp/cache/usage-remaining/`; stale observations are intentionally omitted |
+| The card's reset dates differ from an account's latest result | Check the source observation time and refresh the source. Provider observations are chosen independently; a newer native fetch cannot renew old external data |
 | External source appears only in All/Selected | Add a `modelMappings` entry for the omp provider/model; an OpenAI-compatible endpoint does not identify its backing quota provider |
 | External source shows stale or not refreshed | Check the observation time. For Keeper, turn on its scheduled quota refresh (gear button in Keeper's Auth Files inspection dialog) with an interval under `maxAgeSeconds` (10 minutes by default), or opt into `refresh`; then wait for the next poll |
 | External source returns 401/403 | CPA needs its management key; Keeper needs an administrator session, not an API-key viewer login |
