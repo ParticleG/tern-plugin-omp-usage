@@ -23,16 +23,14 @@
 // the actual quota observation time. Model switches redraw immediately from
 // the last reports, then request an update; source intervals still apply.
 //
-// After each fetch, every available model's line and saved-reset expiries are
-// also written to LINES_FILE, keyed by the name omp's model chip shows. The
-// Tern omp-usage plugin draws the focused pane's line from it, so every pane
-// shows the newest fetch any session made, and reads it for the hover card's
-// expiry dates. Every session writes it: one whose last good fetch is older
-// than the file's leaves it alone, so it can't put older numbers back.
+// After each fetch, publish this instance's model lines and provider pools to
+// its own snapshot. Tern merges independently observed quotas across sessions;
+// a native-only session never replaces another session's external accounts.
 import { execFile } from "node:child_process";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadUsageSources } from "./usage-sources/index.js";
 import { cleanText, limitDetails, reportNotes } from "./usage-sources/details.js";
@@ -42,15 +40,12 @@ const INTERVAL_MS = 60_000;
 const MODEL_CHECK_MS = 1_000;
 const RESET_EXPIRY_WARN_MS = 5 * 86_400_000;
 const TIMEOUT_MS = 15_000;
-const LINES_FILE = join(homedir(), ".omp", "cache", "usage-remaining.json");
+const LINES_DIR = join(homedir(), ".omp", "cache", "usage-remaining");
 const LINES_REFRESH_MS = 120_000;
+const MAX_AGE_MS = 600_000;
 
-// This file's text as the session loaded it. Every omp session writes
-// LINES_FILE, and a session started before an update keeps running the old
-// code, so it would overwrite the updated sessions' lines with its own (a
-// Fable reset's date flipping between two values). A session whose file on
-// disk no longer matches what it loaded stops writing; its own status line
-// stays as it was until it restarts.
+// A session loaded before an update must not keep publishing obsolete output.
+// Include the source adapters because they also determine snapshot semantics.
 const SELF_FILE = (() => {
   try {
     return fileURLToPath(import.meta.url);
@@ -67,6 +62,35 @@ function readSelf() {
     return SELF_FILE ? [SELF_FILE, ...SOURCE_FILES].map((file) => readFileSync(file, "utf8")).join("\n") : undefined;
   } catch {
     return undefined;
+  }
+}
+
+// A crashed instance cannot remove its own file. Never prune by age: a live
+// session may be between refreshes, and an inaccessible PID is not a dead PID.
+function pruneStoppedInstances() {
+  try {
+    const alive = new Map();
+    for (const file of readdirSync(LINES_DIR, { withFileTypes: true })) {
+      if (!file.isFile()) continue;
+      const match = /^([1-9]\d*)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/i.exec(file.name);
+      if (!match) continue;
+      const pid = Number(match[1]);
+      if (!Number.isSafeInteger(pid)) continue;
+      if (!alive.has(pid)) {
+        try {
+          process.kill(pid, 0);
+          alive.set(pid, true);
+        } catch (error) {
+          alive.set(pid, error.code !== "ESRCH");
+        }
+      }
+      if (alive.get(pid) === false) {
+        try { rmSync(join(LINES_DIR, file.name), { force: true }); }
+        catch { /* Cleanup failure must not prevent this instance publishing. */ }
+      }
+    }
+  } catch {
+    // The directory may not exist yet, or discovery may temporarily fail.
   }
 }
 
@@ -540,7 +564,24 @@ function render(state, ctx) {
   ctx.ui.setStatus(STATUS_KEY, lineFor(reports, provider, bare, modelIndex(state.models, state.sources, reports)) || undefined);
 }
 
-// Writes LINES_FILE:
+// A provider's accounts form one observation pool. Native refreshes never
+// advance external observations, including retained reports carrying an error.
+function observationFor(reports, nativeFetchedAt, now) {
+  const external = reports.filter((report) => report.metadata?.sourceId);
+  if (!external.length) return { fetchedAt: reports.length ? nativeFetchedAt : 0, maxAgeMs: MAX_AGE_MS };
+  const snapshots = external.filter((report) => report.limits?.length || report.summary?.length);
+  const observed = (snapshots.length ? snapshots : external)
+    .map((report) => report.observedAt)
+    .filter((at) => typeof at === "number" && Number.isFinite(at) && at > 0 && at <= now);
+  const ages = external.map((report) => report.metadata?.maxAgeMs)
+    .filter((age) => typeof age === "number" && Number.isFinite(age) && age > 0);
+  return {
+    fetchedAt: observed.length ? Math.max(...observed) : snapshots.length ? 0 : now,
+    maxAgeMs: Math.min(MAX_AGE_MS, ...ages),
+  };
+}
+
+// Publishes one atomic instance snapshot:
 // - models: every available model's entry keyed by chip name, { line, resets }
 //   with resets from savedResets, or line "" when its provider isn't tracked.
 //   Two models sharing a chip name but not an entry can't be told apart from
@@ -558,10 +599,17 @@ function render(state, ctx) {
 // already-formatted `valueText` lets the plugin draw a quantity or status
 // without parsing prose.
 async function writeLines(state) {
+  if (state.stopped) return;
   const reports = state.data && Array.isArray(state.data.reports) ? state.data.reports : null;
   const models = state.models;
   if (!reports || !Array.isArray(models)) return;
+  const now = Date.now();
   const index = modelIndex(models, state.sources, reports);
+  const observations = new Map();
+  for (const report of reports) {
+    const provider = String(report?.provider ?? "").toLowerCase();
+    if (!observations.has(provider)) observations.set(provider, observationFor(providerReports(reports, provider), state.nativeFetchedAt, now));
+  }
   const entries = {};
   for (const m of models) {
     const name = chipName(m);
@@ -573,6 +621,7 @@ async function writeLines(state) {
       resets: resetsFor(reports, provider, bare, index),
       provider,
       details: detailsFor(reports, provider, bare, index),
+      ...(observations.get(provider) ?? { fetchedAt: 0, maxAgeMs: MAX_AGE_MS }),
     };
     const same = name in entries && JSON.stringify(entries[name]) === JSON.stringify(entry);
     entries[name] = !(name in entries) || same ? entry : null;
@@ -589,45 +638,43 @@ async function writeLines(state) {
       resets: resetsFor(reports, provider, "", index),
       details: detailsFor(reports, provider, "", index),
       baseProvider: r.metadata?.baseProvider ?? provider,
+      ...observations.get(provider),
     };
     const accounts = accountsFor(reports, provider, "", index).map((a) => a.account);
     if (accounts.length > 1) entry.accounts = accounts;
     providers[provider] = entry;
   }
-  const body = JSON.stringify({ entries, providers });
-  // Unchanged data is still rewritten now and then, so generatedAt tells readers the file is live.
-  const now = Date.now();
+  const ambiguousModels = Object.keys(entries).filter((name) => entries[name] === null);
+  const fetchedAt = Math.max(0, ...Array.from(observations.values(), (observation) => observation.fetchedAt));
+  const body = JSON.stringify({ entries, providers, ambiguousModels, fetchedAt });
+  // Heartbeats keep the instance live, not its independently dated observations.
   if (body === state.writtenLines && now - state.writtenAt < LINES_REFRESH_MS) return;
   if (SELF_SOURCE !== undefined && readSelf() !== SELF_SOURCE) return;
-  // Another session fetched since (this one's fetches failing, or finishing late).
-  if (writtenFetchedAt() > state.fetchedAt) return;
-  mkdirSync(dirname(LINES_FILE), { recursive: true });
-  const tmp = `${LINES_FILE}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify({ generatedAt: now, fetchedAt: state.fetchedAt, models: entries, providers }), { mode: 0o600 });
-  renameSync(tmp, LINES_FILE);
-  state.writtenLines = body;
-  state.writtenAt = now;
-}
-
-// When the reports in LINES_FILE were fetched; 0 when unknown (no file, or
-// one written before it said).
-function writtenFetchedAt() {
+  mkdirSync(LINES_DIR, { recursive: true });
+  const tmp = `${state.linesFile}.${randomUUID()}.tmp`;
   try {
-    const at = JSON.parse(readFileSync(LINES_FILE, "utf8")).fetchedAt;
-    return typeof at === "number" ? at : 0;
-  } catch {
-    return 0;
+    writeFileSync(tmp, JSON.stringify({ generatedAt: now, fetchedAt, models: entries, providers, ambiguousModels }), { mode: 0o600 });
+    renameSync(tmp, state.linesFile);
+    state.writtenLines = body;
+    state.writtenAt = now;
+  } finally {
+    rmSync(tmp, { force: true });
   }
 }
 
 async function update(state, ctx) {
+  if (state.stopped) return;
   try {
     // Fetched whatever the main model is: a viewed subagent can use another provider.
-    const [data, external] = await Promise.all([fetchUsageJson(), state.sources?.poll() ?? []]);
+    const [native, external] = await Promise.all([
+      fetchUsageJson().then((data) => ({ data, fetchedAt: Date.now() })),
+      state.sources?.poll() ?? [],
+    ]);
+    if (state.stopped) return;
     // A failed native fetch keeps its last reports without advancing any source observation clock.
-    if (data && Array.isArray(data.reports)) {
-      state.nativeReports = data.reports;
-      state.fetchedAt = Date.now();
+    if (native.data && Array.isArray(native.data.reports)) {
+      state.nativeReports = native.data.reports;
+      state.nativeFetchedAt = native.fetchedAt;
     }
     state.data = { reports: [...state.nativeReports, ...external] };
     const models = await ctx.models?.list?.();
@@ -651,13 +698,13 @@ function checkModel(state, ctx) {
 }
 
 export default function usageRemaining(pi) {
-  // Per session: the last `omp usage --json` reports and when they came, the
-  // configured sources, the available models, the model last drawn and the
-  // lines last written to LINES_FILE, and when.
+  // Each factory is independent, even when several sessions share one process.
   const state = {
     data: null,
     nativeReports: [],
-    fetchedAt: 0,
+    nativeFetchedAt: 0,
+    linesFile: join(LINES_DIR, `${process.pid}-${randomUUID()}.json`),
+    stopped: false,
     models: null,
     sources: null,
     sourceError: null,
@@ -671,6 +718,7 @@ export default function usageRemaining(pi) {
     state.sourceError = error instanceof Error ? error.message : "Cannot load usage sources";
   }
   pi.on("session_start", async (_event, ctx) => {
+    pruneStoppedInstances();
     if (state.sourceError) ctx.ui.notify?.(state.sourceError, "warning");
     await update(state, ctx);
     ctx.setInterval(() => {
@@ -684,5 +732,9 @@ export default function usageRemaining(pi) {
   // An auto-retry fallback can switch provider mid-turn.
   pi.on("retry_fallback_applied", async (_event, ctx) => {
     checkModel(state, ctx);
+  });
+  pi.on("session_shutdown", () => {
+    state.stopped = true;
+    rmSync(state.linesFile, { force: true });
   });
 }

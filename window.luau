@@ -4,9 +4,9 @@
 --
 -- The extension stays the source of truth: it picks the active model's provider, its applicable windows,
 -- saved resets and countdowns. It sets that line with `ctx.ui.setStatus`, which omp draws in the composer bar's
--- extras, and after every fetch it also writes ~/.omp/cache/usage-remaining.json: every model's line keyed by
--- the name omp's model chip shows, every provider's plan-wide line, and the saved resets' expiry dates. This
--- plugin reads both from the focused agent pane and draws the line with CSS above the hairline's meter,
+-- extras, and after every fetch it also writes its own snapshot under ~/.omp/cache/usage-remaining/: every
+-- model's line keyed by the name omp's model chip shows, every provider's plan-wide line, and saved resets.
+-- The plugin merges fresh snapshots with the focused agent pane's status and draws the line above the hairline,
 -- rewritten with `tern.css` when it changes. Other `ctx.ui.setStatus` parts are drawn there too, except the
 -- `◫ …` context gauge (context-used.js), which the hairline already shows. The rest of omp's status line (path,
 -- git, cost, …) stays in the bar; only the facts the line redraws are hidden there, in the focused pane.
@@ -50,9 +50,8 @@
 -- Update checks for this copy (a linked clone or an installed one), and the prompt that offers them (update.luau).
 local update = require("./update")
 
--- Re-reads the composer dock (~40 nodes) every second, and the cache's text (a few KB, decoded only when it
--- changed) as `poll_cache` last fetched it. The usage-remaining extension redraws within a second of a model
--- switch, so this follows it within about two.
+-- Re-reads the composer dock (~40 nodes) every second and parses the asynchronously merged snapshots only
+-- when their contents or freshness change. Model switches follow the extension's redraw within about two seconds.
 local POLL_MS = 1000
 local SHEET = "usage"
 -- omp's composer bar extras: one `hook-N` fact per `ctx.ui.setStatus` key with `statusLine.showHookStatus`,
@@ -70,10 +69,7 @@ local MODEL_ROLE = "omp.composer.model"
 local NAME_SUFFIX = "/name"
 local SEPARATOR = " · " -- omp joins setStatus values with it; usage-remaining joins its windows with it too
 local CONTEXT_PREFIX = "◫" -- context-used.js
--- The extension's cache, under the home directory; older than this it is ignored.
-local CACHE_FILE = "/.omp/cache/usage-remaining.json"
-local CACHE_MAX_BYTES = 1048576
-local CACHE_MAX_AGE_MS = 10 * 60 * 1000
+local usage_cache = require("./cache")
 -- usage-remaining.js window labels, spelled out in the card.
 local WINDOW_NAMES: { [string]: string } = { ["5h"] = "5-hour", ["1d"] = "Daily", ["7d"] = "Weekly", mo = "Monthly" }
 local WEEKDAYS = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" }
@@ -267,10 +263,9 @@ local card_rows: { Row } = {}
 -- For the card `card` last built: how many rows each account shown in full takes, by `<group key>/<account>`
 -- (the panel reads it straight after a `fixed = "all"` card, to find the picks that make the tallest card).
 local card_runs: { [string]: number } = {}
--- The cache file as last read, its parse, and the last providers it listed (see `read_cache`).
-local cache_raw: string? = nil
+-- The merged document's identity changes on a snapshot update or independent observation expiry.
+local cache_document: any = nil
 local cache_parsed: Cache? = nil
-local providers_seen: { at: number, list: { Provider } }? = nil
 
 local function now_ms(): number
 	return os.time() * 1000
@@ -619,9 +614,8 @@ local function details_of(value: any): { Detail }
 	return details
 end
 
--- The cache as decoded JSON: model entries by chip name (`null` ones, two models sharing a chip name, are
--- dropped by the decoder, which reads the same as missing) and the providers in the preset order (decoding
--- loses the file's). `providers` is nil when the file has none, as written before it listed them.
+-- The merged cache as decoded JSON: model entries by chip name (ambiguous names remain absent), and
+-- providers in the preset order. Snapshot and observation freshness are enforced by the reader module.
 local function parse_cache(doc: any): Cache?
 	if type(doc) ~= "table" or type(doc.generatedAt) ~= "number" then
 		return nil
@@ -684,69 +678,15 @@ local function parse_cache(doc: any): Cache?
 	return cache
 end
 
--- The cache to use now: nil when missing, unreadable or older than 10 minutes. A read that doesn't decode (a
--- half-replaced file) keeps the last good one, and a file without providers (an omp session still running an
--- extension from before they were listed) borrows the last ones seen, while they are fresh.
-local function fresh_cache(parsed: Cache?, seen: { at: number, list: { Provider } }?, now: number): Cache?
-	if parsed == nil or now - parsed.at > CACHE_MAX_AGE_MS then
-		return nil
-	end
-	if parsed.providers == nil and seen and now - seen.at <= CACHE_MAX_AGE_MS then
-		return { at = parsed.at, models = parsed.models, providers = seen.list }
-	end
-	return parsed
-end
-
--- The cache file's text as last read (nil until it has been). `tern.fs.read` would read it on the window's thread,
--- and opening the file just after omp rewrites it can wait on another program (a virus scan) for longer than a
--- timer's 50 ms budget, which, tripped, turns off every timer of the plugin until a reload; so it is read with
--- `cx.docs:read`, whose answer comes back later, every few seconds.
-local CACHE_POLL_MS = 3000
-local cache_text: string? = nil
-
-local CACHE_PATH: string? = (function(): string?
-	local home = tern.getenv("USERPROFILE") or tern.getenv("HOME")
-	return if home and home ~= "" then home .. CACHE_FILE else nil
-end)()
-
-local function poll_cache(cx: WindowCx?)
-	tern.timer(CACHE_POLL_MS, poll_cache)
-	local path = CACHE_PATH
-	if cx == nil or path == nil then
-		return
-	end
-	local ok, reading = pcall(function(): any
-		return (cx :: WindowCx).docs:read(path :: string)
-	end)
-	if ok and reading then
-		-- a failed read (the file being replaced, or gone) keeps the last text: it goes stale on its own
-		reading:next(function(text: string?, _err: string?, _later: WindowCx?)
-			if type(text) == "string" and #text <= CACHE_MAX_BYTES then
-				cache_text = text
-			end
-		end)
-	end
-end
-
-tern.timer(0, poll_cache)
+usage_cache.start()
 
 local function read_cache(now: number): Cache?
-	local raw = cache_text
-	if raw == nil then
-		return nil
+	local doc = usage_cache.read(now)
+	if doc ~= cache_document then
+		cache_document = doc
+		cache_parsed = if doc ~= nil then parse_cache(doc) else nil
 	end
-	if raw ~= cache_raw then
-		local decoded, doc = pcall(tern.json.decode, raw)
-		local parsed = if decoded then parse_cache(doc) else nil
-		if parsed then
-			cache_raw = raw
-			cache_parsed = parsed
-			if parsed.providers then
-				providers_seen = { at = parsed.at, list = parsed.providers :: { Provider } }
-			end
-		end
-	end
-	return fresh_cache(cache_parsed, providers_seen, now)
+	return cache_parsed
 end
 
 -- The providers to offer: the cache's, else the known ones.
@@ -2908,17 +2848,16 @@ refresh = function(cx: WindowCx)
 		return
 	end
 	local settings = load_settings()
-	local raw = cache_raw
+	local previous = cache_document
 	local cache = read_cache(now_ms())
 	if target ~= nil then
 		show_pane(cx, target :: number, settings, cache)
 	end
-	-- A poll that just decoded a rewritten cache (the extension's, once a minute; tens of ms for a big one) has
-	-- spent much of its timer's 50ms: the panel's redraw waits for the next poll.
-	if panel_pane ~= nil and cache_raw == raw then
+	-- Parsing a changed merged cache can spend much of the timer's 50ms; defer panels until the next poll.
+	if panel_pane ~= nil and cache_document == previous then
 		sync_panel(cx, false, settings, cache)
 	end
-	if detail_view.pane ~= nil and cache_raw == raw then
+	if detail_view.pane ~= nil and cache_document == previous then
 		sync_details(cx, false, settings, cache)
 	end
 end

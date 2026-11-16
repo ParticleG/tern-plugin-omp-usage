@@ -54,7 +54,7 @@ test("CPA Spark quota applies to the Spark model, not an ordinary model or an un
   // suppressed; the CPA adapter still crosses a real local HTTP boundary.
   const script = `
     import childProcess from 'node:child_process';
-    import { readFileSync } from 'node:fs';
+    import { readFileSync, readdirSync } from 'node:fs';
     import { syncBuiltinESMExports } from 'node:module';
     import { join } from 'node:path';
     childProcess.execFile = (_file, _args, _options, callback) => {
@@ -75,7 +75,11 @@ test("CPA Spark quota applies to the Spark model, not an ordinary model or an un
     };
     extension({ on: (event, callback) => { handlers[event] = callback; } });
     await handlers.session_start({}, ctx);
-    const cache = JSON.parse(readFileSync(join(process.env.HOME, '.omp', 'cache', 'usage-remaining.json'), 'utf8'));
+    const directory = join(process.env.HOME, '.omp', 'cache', 'usage-remaining');
+    const files = readdirSync(directory);
+    if (files.length !== 1) throw new Error('Expected exactly one instance snapshot');
+    const cache = JSON.parse(readFileSync(join(directory, files[0]), 'utf8'));
+    await handlers.session_shutdown({}, ctx);
     console.log(JSON.stringify({ cache, status: statuses.at(-1) }));
   `;
   const { stdout } = await run(process.execPath, ["--input-type=module", "-e", script], {
