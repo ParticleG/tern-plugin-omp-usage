@@ -25,9 +25,10 @@
 //
 // After each fetch, every available model's line and saved-reset expiries are
 // also written to LINES_FILE, keyed by the name omp's model chip shows. The
-// Tern omp-usage plugin reads it for the hover card's expiry dates, and while
-// a subagent's transcript is viewed (omp's chip then shows the subagent's
-// model, but the status stays the main session's) for that model's line.
+// Tern omp-usage plugin draws the focused pane's line from it, so every pane
+// shows the newest fetch any session made, and reads it for the hover card's
+// expiry dates. Every session writes it: one whose last good fetch is older
+// than the file's leaves it alone, so it can't put older numbers back.
 import { execFile } from "node:child_process";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -598,12 +599,25 @@ async function writeLines(state) {
   const now = Date.now();
   if (body === state.writtenLines && now - state.writtenAt < LINES_REFRESH_MS) return;
   if (SELF_SOURCE !== undefined && readSelf() !== SELF_SOURCE) return;
+  // Another session fetched since (this one's fetches failing, or finishing late).
+  if (writtenFetchedAt() > state.fetchedAt) return;
   mkdirSync(dirname(LINES_FILE), { recursive: true });
   const tmp = `${LINES_FILE}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify({ generatedAt: now, models: entries, providers }), { mode: 0o600 });
+  writeFileSync(tmp, JSON.stringify({ generatedAt: now, fetchedAt: state.fetchedAt, models: entries, providers }), { mode: 0o600 });
   renameSync(tmp, LINES_FILE);
   state.writtenLines = body;
   state.writtenAt = now;
+}
+
+// When the reports in LINES_FILE were fetched; 0 when unknown (no file, or
+// one written before it said).
+function writtenFetchedAt() {
+  try {
+    const at = JSON.parse(readFileSync(LINES_FILE, "utf8")).fetchedAt;
+    return typeof at === "number" ? at : 0;
+  } catch {
+    return 0;
+  }
 }
 
 async function update(state, ctx) {
@@ -611,7 +625,10 @@ async function update(state, ctx) {
     // Fetched whatever the main model is: a viewed subagent can use another provider.
     const [data, external] = await Promise.all([fetchUsageJson(), state.sources?.poll() ?? []]);
     // A failed native fetch keeps its last reports without advancing any source observation clock.
-    if (data && Array.isArray(data.reports)) state.nativeReports = data.reports;
+    if (data && Array.isArray(data.reports)) {
+      state.nativeReports = data.reports;
+      state.fetchedAt = Date.now();
+    }
     state.data = { reports: [...state.nativeReports, ...external] };
     const models = await ctx.models?.list?.();
     if (Array.isArray(models)) state.models = models;
@@ -634,9 +651,20 @@ function checkModel(state, ctx) {
 }
 
 export default function usageRemaining(pi) {
-  // Per session: the last `omp usage --json` reports and available models, the
-  // model last drawn and the lines last written to LINES_FILE, and when.
-  const state = { data: null, nativeReports: [], models: null, sources: null, sourceError: null, shownModel: undefined, writtenLines: undefined, writtenAt: 0 };
+  // Per session: the last `omp usage --json` reports and when they came, the
+  // configured sources, the available models, the model last drawn and the
+  // lines last written to LINES_FILE, and when.
+  const state = {
+    data: null,
+    nativeReports: [],
+    fetchedAt: 0,
+    models: null,
+    sources: null,
+    sourceError: null,
+    shownModel: undefined,
+    writtenLines: undefined,
+    writtenAt: 0,
+  };
   try {
     state.sources = loadUsageSources();
   } catch (error) {
