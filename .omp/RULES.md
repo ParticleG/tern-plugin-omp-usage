@@ -13,6 +13,12 @@
   (`<img src="…" alt="…" width="…">`), so a 2× picture reads at its real size.
 - **History:** squash a feature's local commits into one before pushing. Never rewrite commits already on GitHub:
   the plugin's updater only fast-forwards, so a rewrite strands everyone who already pulled.
+- **Versions:** this fork's quota sources, quota details, hover estimates and their follow-ups are one feature line
+  on top of the original plugin, numbered `0.6.x`. Every commit that changes the plugin, a merge of the original's
+  `main` included, sets the next `x` in `plugin.toml` and `omp-usage/plugin.toml`; a number is never set twice.
+  Copies installed from Tern find the commit they are by that version along `main`'s first parents, merges
+  included, so set it on `main`'s own line, never in a branch you merge. The fork first shipped as 0.5.0, 0.6.0,
+  0.7.0 and 0.8.0; those are 0.6.0 to 0.6.3, and the numbering went on at 0.6.4.
 - **Commit messages are release notes.** The update card shows users every commit that changes the plugin (anything
   but the README, `docs/` and `.omp/`), in full: the subject as a heading, the body as Markdown (hard wraps joined, lists and
   `code` kept). Write them for the person deciding whether to update:
